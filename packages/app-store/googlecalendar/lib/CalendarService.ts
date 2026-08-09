@@ -73,6 +73,72 @@ const isGaxiosResponse = (error: unknown): error is GaxiosResponse<calendar_v3.S
   // biome-ignore lint/suspicious/noPrototypeBuiltins: Object.hasOwn not available in all build targets
   typeof error === "object" && !!error && Object.prototype.hasOwnProperty.call(error, "config");
 
+/**
+ * Google's throttling responses, which are retryable rather than fatal.
+ *
+ * Calendar signals throttling as 403 with a `usageLimits` reason as well as the
+ * more obvious 429 — a 403 that means "slow down", not "you may not do this".
+ * Treating it as a permanent failure is what turns a transient limit into a
+ * booking with no meeting link.
+ */
+const RETRYABLE_GOOGLE_REASONS = new Set([
+  "rateLimitExceeded",
+  "userRateLimitExceeded",
+  "quotaExceeded",
+  "backendError",
+  "internalError",
+]);
+
+function isRetryableGoogleError(error: unknown): boolean {
+  const err = error as {
+    code?: number;
+    status?: number;
+    errors?: { reason?: string }[];
+    response?: { status?: number; data?: { error?: { errors?: { reason?: string }[] } } };
+  };
+  const status = err?.code ?? err?.status ?? err?.response?.status;
+  if (status === 429) return true;
+
+  const reasons = [...(err?.errors ?? []), ...(err?.response?.data?.error?.errors ?? [])]
+    .map((e) => e?.reason)
+    .filter((r): r is string => !!r);
+
+  if (status === 403) return reasons.some((r) => RETRYABLE_GOOGLE_REASONS.has(r));
+  return status === 500 || status === 503;
+}
+
+/**
+ * Retry with exponential backoff, for Google calls that are worth repeating.
+ *
+ * Deliberately short: a booking request is synchronous and someone is watching a
+ * spinner, so this trades a couple of seconds for a materially better success
+ * rate and gives up rather than holding the request open.
+ */
+async function withGoogleRetry<T>(
+  operation: () => Promise<T>,
+  context: { label: string; logger: typeof logger }
+): Promise<T> {
+  const delaysMs = [400, 1200, 2500];
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt === delaysMs.length || !isRetryableGoogleError(error)) throw error;
+      const wait = delaysMs[attempt];
+      context.logger.warn(
+        `${context.label}: Google throttled us, retrying in ${wait}ms (attempt ${attempt + 1}/${
+          delaysMs.length
+        })`
+      );
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+  throw lastError;
+}
+
 class GoogleCalendarService implements Calendar {
   private integrationName = "";
   private auth: CalendarAuth;
@@ -280,12 +346,16 @@ class GoogleCalendarService implements Calendar {
           });
         }
       } else {
-        const eventResponse = await calendar.events.insert({
-          calendarId: selectedCalendar,
-          requestBody: payload,
-          conferenceDataVersion: 1,
-          sendUpdates: "none",
-        });
+        const eventResponse = await withGoogleRetry(
+          () =>
+            calendar.events.insert({
+              calendarId: selectedCalendar,
+              requestBody: payload,
+              conferenceDataVersion: 1,
+              sendUpdates: "none",
+            }),
+          { label: "createEvent/insert", logger: this.log }
+        );
         event = eventResponse.data;
         if (event.recurrence) {
           if (event.recurrence.length > 0) {
@@ -296,26 +366,50 @@ class GoogleCalendarService implements Calendar {
       }
 
       if (event && event.id && event.hangoutLink) {
-        await calendar.events.patch({
-          // Update the same event but this time we know the hangout link
-          calendarId: selectedCalendar,
-          eventId: event.id || "",
-          requestBody: {
-            description: getRichDescription({
-              ...calEvent,
-              additionalInformation: { hangoutLink: event.hangoutLink },
-            }),
-            location: getLocation({
-              videoCallData: calEvent.videoCallData,
-              additionalInformation: {
-                ...calEvent.additionalInformation,
-                hangoutLink: event.hangoutLink,
-              },
-              location: calEvent.location,
-              uid: calEvent.uid,
-            }),
-          },
-        });
+        // Cosmetic, and deliberately non-fatal.
+        //
+        // The event already exists on Google and already carries the Meet link;
+        // this second call only rewrites the description and location so the
+        // link is visible in the invitation body. When Google throttles it, the
+        // old code let the exception escape the enclosing try, which failed the
+        // whole calendar integration for a booking that had in fact succeeded —
+        // Cal then stored a BookingReference with an empty uid and no
+        // meetingUrl, and every downstream email and webhook showed the raw
+        // string "integrations:google:meet" instead of the meeting link.
+        //
+        // Losing the tidied description is a cosmetic regression. Losing the
+        // meeting link is a customer sitting in an empty room.
+        try {
+          await withGoogleRetry(
+            () =>
+              calendar.events.patch({
+                calendarId: selectedCalendar,
+                eventId: event?.id || "",
+                requestBody: {
+                  description: getRichDescription({
+                    ...calEvent,
+                    additionalInformation: { hangoutLink: event?.hangoutLink },
+                  }),
+                  location: getLocation({
+                    videoCallData: calEvent.videoCallData,
+                    additionalInformation: {
+                      ...calEvent.additionalInformation,
+                      hangoutLink: event?.hangoutLink,
+                    },
+                    location: calEvent.location,
+                    uid: calEvent.uid,
+                  }),
+                },
+              }),
+            { label: "createEvent/patch-hangout-link", logger: this.log }
+          );
+        } catch (patchError) {
+          this.log.warn(
+            "Created the Google event but could not write the Meet link into its description. " +
+              "The booking and the meeting link are intact; only the invitation body is less tidy.",
+            safeStringify({ patchError, selectedCalendar, credentialId, eventId: event.id })
+          );
+        }
       }
 
       return {
@@ -402,14 +496,18 @@ class GoogleCalendarService implements Calendar {
         : undefined) || "primary";
 
     try {
-      const evt = await calendar.events.update({
-        calendarId: selectedCalendar,
-        eventId: uid,
-        sendNotifications: true,
-        sendUpdates: "none",
-        requestBody: payload,
-        conferenceDataVersion: 1,
-      });
+      const evt = await withGoogleRetry(
+        () =>
+          calendar.events.update({
+            calendarId: selectedCalendar,
+            eventId: uid,
+            sendNotifications: true,
+            sendUpdates: "none",
+            requestBody: payload,
+            conferenceDataVersion: 1,
+          }),
+        { label: "updateEvent/update", logger: this.log }
+      );
 
       this.log.debug("Updated Google Calendar Event", {
         startTime: evt?.data.start,
@@ -417,26 +515,39 @@ class GoogleCalendarService implements Calendar {
       });
 
       if (evt && evt.data.id && evt.data.hangoutLink && event.location === MeetLocationType) {
-        await calendar.events.patch({
-          // Update the same event but this time we know the hangout link
-          calendarId: selectedCalendar,
-          eventId: evt.data.id || "",
-          requestBody: {
-            description: getRichDescription({
-              ...event,
-              additionalInformation: { hangoutLink: evt.data.hangoutLink },
-            }),
-            location: getLocation({
-              videoCallData: event.videoCallData,
-              additionalInformation: {
-                ...event.additionalInformation,
-                hangoutLink: evt.data.hangoutLink,
-              },
-              location: event.location,
-              uid: event.uid,
-            }),
-          },
-        });
+        // Same reasoning as createEvent: cosmetic, so never fatal. A reschedule
+        // that throws here would lose the meeting link on an event that moved
+        // successfully.
+        try {
+          await withGoogleRetry(
+            () =>
+              calendar.events.patch({
+                calendarId: selectedCalendar,
+                eventId: evt.data.id || "",
+                requestBody: {
+                  description: getRichDescription({
+                    ...event,
+                    additionalInformation: { hangoutLink: evt.data.hangoutLink },
+                  }),
+                  location: getLocation({
+                    videoCallData: event.videoCallData,
+                    additionalInformation: {
+                      ...event.additionalInformation,
+                      hangoutLink: evt.data.hangoutLink,
+                    },
+                    location: event.location,
+                    uid: event.uid,
+                  }),
+                },
+              }),
+            { label: "updateEvent/patch-hangout-link", logger: this.log }
+          );
+        } catch (patchError) {
+          this.log.warn(
+            "Updated the Google event but could not rewrite its description with the Meet link.",
+            safeStringify({ patchError, selectedCalendar, eventId: evt.data.id })
+          );
+        }
         return {
           uid: "",
           ...evt.data,
