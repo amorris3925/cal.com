@@ -1,0 +1,12 @@
+# Deploy target for Coolify — pulls the image instead of building it.
+#
+# The real build is ./Dockerfile, and it does not fit on the Coolify host: the
+# Next build completes (183/183 pages) and the build container is then killed
+# with exit 255, the signature of an OOM. The same Dockerfile builds cleanly on
+# the Henry box (15GB RAM), so the image is built there and pushed to GHCR.
+#
+#   ssh root@178.156.208.39 /root/build_cal.sh     # build + push
+#
+# Coolify then "builds" this file, which is a pull and costs no memory. Point
+# dockerfile_location back at /Dockerfile if the host is ever given more RAM.
+FROM ghcr.io/king-dobby/calcom:latest
