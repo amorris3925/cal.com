@@ -366,6 +366,12 @@ class GoogleCalendarService implements Calendar {
       }
 
       if (event && event.id && event.hangoutLink) {
+        // Bound to consts so the narrowing survives into the closure below —
+        // `event` is a mutable `let`, so TypeScript discards what the guard
+        // above proved once the values are read inside a callback.
+        const createdEventId = event.id;
+        const createdHangoutLink = event.hangoutLink;
+
         // Cosmetic, and deliberately non-fatal.
         //
         // The event already exists on Google and already carries the Meet link;
@@ -384,17 +390,17 @@ class GoogleCalendarService implements Calendar {
             () =>
               calendar.events.patch({
                 calendarId: selectedCalendar,
-                eventId: event?.id || "",
+                eventId: createdEventId,
                 requestBody: {
                   description: getRichDescription({
                     ...calEvent,
-                    additionalInformation: { hangoutLink: event?.hangoutLink },
+                    additionalInformation: { hangoutLink: createdHangoutLink },
                   }),
                   location: getLocation({
                     videoCallData: calEvent.videoCallData,
                     additionalInformation: {
                       ...calEvent.additionalInformation,
-                      hangoutLink: event?.hangoutLink,
+                      hangoutLink: createdHangoutLink,
                     },
                     location: calEvent.location,
                     uid: calEvent.uid,
@@ -407,7 +413,7 @@ class GoogleCalendarService implements Calendar {
           this.log.warn(
             "Created the Google event but could not write the Meet link into its description. " +
               "The booking and the meeting link are intact; only the invitation body is less tidy.",
-            safeStringify({ patchError, selectedCalendar, credentialId, eventId: event.id })
+            safeStringify({ patchError, selectedCalendar, credentialId, eventId: createdEventId })
           );
         }
       }
