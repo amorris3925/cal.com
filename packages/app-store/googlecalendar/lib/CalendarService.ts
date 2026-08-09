@@ -385,27 +385,32 @@ class GoogleCalendarService implements Calendar {
         //
         // Losing the tidied description is a cosmetic regression. Losing the
         // meeting link is a customer sitting in an empty room.
+        // Built outside the retry callback — see the note in updateEvent. The
+        // guard above proves hangoutLink is a string; reading it inside a
+        // closure would throw that away.
+        const patchRequestBody = {
+          description: getRichDescription({
+            ...calEvent,
+            additionalInformation: { hangoutLink: createdHangoutLink },
+          }),
+          location: getLocation({
+            videoCallData: calEvent.videoCallData,
+            additionalInformation: {
+              ...calEvent.additionalInformation,
+              hangoutLink: createdHangoutLink,
+            },
+            location: calEvent.location,
+            uid: calEvent.uid,
+          }),
+        };
+
         try {
           await withGoogleRetry(
             () =>
               calendar.events.patch({
                 calendarId: selectedCalendar,
                 eventId: createdEventId,
-                requestBody: {
-                  description: getRichDescription({
-                    ...calEvent,
-                    additionalInformation: { hangoutLink: createdHangoutLink },
-                  }),
-                  location: getLocation({
-                    videoCallData: calEvent.videoCallData,
-                    additionalInformation: {
-                      ...calEvent.additionalInformation,
-                      hangoutLink: createdHangoutLink,
-                    },
-                    location: calEvent.location,
-                    uid: calEvent.uid,
-                  }),
-                },
+                requestBody: patchRequestBody,
               }),
             { label: "createEvent/patch-hangout-link", logger: this.log }
           );
@@ -521,30 +526,42 @@ class GoogleCalendarService implements Calendar {
       });
 
       if (evt && evt.data.id && evt.data.hangoutLink && event.location === MeetLocationType) {
-        // Same reasoning as createEvent: cosmetic, so never fatal. A reschedule
-        // that throws here would lose the meeting link on an event that moved
-        // successfully.
+        // Bound under the guard for the same reason as createEvent: reading
+        // these inside the retry callback would widen them back to
+        // `string | null | undefined`.
+        const updatedEventId = evt.data.id;
+        const updatedHangoutLink = evt.data.hangoutLink;
+
+        // Built here, outside the retry callback, on purpose. Everything below
+        // depends on narrowing the guard above established (hangoutLink is a
+        // string, location is MeetLocationType); TypeScript discards all of it
+        // the moment these are read inside a closure. Constructing the body
+        // first keeps the callback down to passing one already-typed object.
+        const patchRequestBody = {
+          description: getRichDescription({
+            ...event,
+            additionalInformation: { hangoutLink: updatedHangoutLink },
+          }),
+          location: getLocation({
+            videoCallData: event.videoCallData,
+            additionalInformation: {
+              ...event.additionalInformation,
+              hangoutLink: updatedHangoutLink,
+            },
+            location: event.location,
+            uid: event.uid,
+          }),
+        };
+
+        // Cosmetic, so never fatal. A reschedule that throws here would lose
+        // the meeting link on an event that moved successfully.
         try {
           await withGoogleRetry(
             () =>
               calendar.events.patch({
                 calendarId: selectedCalendar,
-                eventId: evt.data.id || "",
-                requestBody: {
-                  description: getRichDescription({
-                    ...event,
-                    additionalInformation: { hangoutLink: evt.data.hangoutLink },
-                  }),
-                  location: getLocation({
-                    videoCallData: event.videoCallData,
-                    additionalInformation: {
-                      ...event.additionalInformation,
-                      hangoutLink: evt.data.hangoutLink,
-                    },
-                    location: event.location,
-                    uid: event.uid,
-                  }),
-                },
+                eventId: updatedEventId,
+                requestBody: patchRequestBody,
               }),
             { label: "updateEvent/patch-hangout-link", logger: this.log }
           );
